@@ -1,0 +1,116 @@
+#! /bin/env python3
+
+import glob
+import os
+import shutil
+import sys
+
+
+class AmbergenMarkupGenerator:
+
+    def __init__(self, path):
+
+        self.path = path
+
+        self.metadata = {
+            "title": "Title",
+            "description": "Description",
+            "author": "Author",
+            "date": "2000-01-01",
+            "template": "article.html",
+        }
+
+        self.html = ""
+
+        self.write()
+
+    def write(self):
+        self.file = open(self.path, "r")
+
+        # FIXME: Obviously.
+        self.html = self.file.read()
+
+        self.file.close()
+
+
+class Generator:
+
+    def __init__(self, source_dir="", build_dir="public"):
+        self.source_dir = os.path.abspath(source_dir)
+        self.build_dir = os.path.abspath(build_dir)
+
+        self.assets_dir = os.path.join(self.source_dir, "assets")
+        self.content_dir = os.path.join(self.source_dir, "content")
+        self.templates_dir = os.path.join(self.source_dir, "templates")
+
+        print(f"Source dir: '{self.source_dir}'")
+        print(f"Build dir: '{self.source_dir}'")
+
+        self.templates = {}
+
+    def getTemplate(self, path):
+        t = self.templates.get(path)
+        if not t:
+            f = open(os.path.join(self.templates_dir, path), "r")
+            t = f.read()
+            f.close()
+
+        return t
+
+    def generatePage(self, markup, build_path):
+        template_path = markup.metadata["template"]
+
+        generated = self.getTemplate(template_path).format(
+            title = markup.metadata["title"],
+            description = markup.metadata["description"],
+            author = markup.metadata["author"],
+            date = markup.metadata["date"],
+            body = markup.html,
+        )
+
+        f = open(build_path, "w")
+        f.write(generated)
+        f.close()
+
+    def build(self):
+        print("Building site...")
+
+        shutil.copytree(self.assets_dir, self.build_dir, dirs_exist_ok=True)
+
+        # Enumerate .am files in content/.
+        source_paths = glob.glob(os.path.join(self.content_dir, "**"), recursive=True)
+
+        for source_path in source_paths:
+            if os.path.isdir(source_path):
+                continue
+            if not source_path.endswith(".am"):
+                continue
+
+            print(f"Building {source_path}...")
+
+            build_path = source_path[len(self.content_dir) + 1:]
+            build_path = os.path.join(self.build_dir, build_path)
+            build_path = os.path.splitext(build_path)[0] + ".html"
+
+            try: os.mkdir(os.path.dirname(build_path))
+            except: pass
+
+            markup = AmbergenMarkupGenerator(source_path)
+
+            self.generatePage(markup, build_path)
+
+
+def commandBuild():
+    ag = Generator()
+    ag.build()
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        COMMAND = sys.argv[1].lower().strip()
+    else:
+        COMMAND = "build"
+
+    if COMMAND == "build":
+        commandBuild()
+    else:
+        print(f"Unknown command '{COMMAND}'")
