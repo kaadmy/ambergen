@@ -1,5 +1,6 @@
 #! /bin/env python3
 
+import enum
 import glob
 import os
 import shutil
@@ -8,29 +9,317 @@ import sys
 
 class AmbergenMarkupGenerator:
 
-    def __init__(self, path):
+    # ========================================
+    #
+    # Tag callback functions.
+
+    def tagLinkUrlEnd(self):
+        latest_region = self.getLatestRegion()
+        latest_region["export"] = False
+
+        self.getLatestRegion("link")["html_values"]["href"] = latest_region["html"]
+
+    # ========================================
+    #
+    # Tag definition table.
+
+    TAGS = {
+        "normal": {
+            "begin": "None",
+            "end": "None",
+            "html_tag": "p",
+        },
+        "italic": {
+            "begin": "/",
+            "end": "/",
+            "html_tag": "em",
+            "html_classes": "markup-italic",
+        },
+        "bold": {
+            "begin": "*",
+            "end": "*",
+            "html_tag": "strong",
+            "html_classes": "markup-bold",
+        },
+        "underline": {
+            "begin": "_",
+            "end": "_",
+            "html_tag": "span",
+            "html_classes": "markup-underline",
+        },
+        "strikethrough": {
+            "begin": "~",
+            "end": "~",
+            "html_tag": "span",
+            "html_classes": "markup-strikethrough",
+        },
+        "code": {
+            "begin": "`",
+            "end": "`",
+            "exclusive": True,
+            "html_tag": "code",
+            "html_classes": "markup-code",
+        },
+        "link": {
+            "begin": "[",
+            "end": "]",
+            "region": True,
+            "html_tag": "a",
+            "html_classes": "markup-link",
+        },
+        "link_url": {
+            "begin": "(",
+            "end": ")",
+            "exclusive": True,
+            "region": True,
+            "end_func": tagLinkUrlEnd,
+        },
+    }
+
+    # ========================================
+    #
+    # Constructor.
+
+    def __init__(self, path, only_metadata=False):
+        self.TAG_BEGINS = { self.TAGS[x]["begin"]: x for x in self.TAGS }
+        self.TAG_ENDS = { self.TAGS[x]["end"]: x for x in self.TAGS }
 
         self.path = path
+        self.only_metadata = only_metadata
 
+        self.metadata_length = 0
         self.metadata = {
             "title": "Title",
-            "description": "Description",
             "author": "Author",
             "date": "2000-01-01",
             "template": "article.html",
         }
 
+        self.regions = []
+
+        self.source = ""
         self.html = ""
 
-        self.write()
+        self.parse()
 
-    def write(self):
-        self.file = open(self.path, "r")
+    # ========================================
+    #
+    # Preliminary metadata parsing.
 
-        # FIXME: Obviously.
-        self.html = self.file.read()
+    def parse(self):
+        f = open(self.path, "r")
+        self.source = f.read()
+        f.close()
 
-        self.file.close()
+        self.parseMetadata()
+
+        if not self.only_metadata:
+            self.parseMarkup()
+
+    def parseMetadata(self):
+        SEPARATOR = "---"
+
+        self.metadata_length = self.source.find(SEPARATOR)
+        if self.metadata_length == -1:
+            self.metadata_length = len(self.source)
+
+        lines = self.source[:self.metadata_length].split("\n")
+        for line in lines:
+            line = line.strip().split(" ", 1)
+            if len(line) < 2:
+                continue
+
+            self.metadata[line[0].strip()] = line[1].strip()
+
+        self.metadata_length += len(SEPARATOR)
+
+    # ========================================
+    #
+    # Region.
+
+    def appendRegion(self, tag="normal"):
+        self.regions.append({
+            "export": True,
+            "tag": tag,
+            "html_values": {
+                "class": self.TAGS[tag].get("html_classes"),
+            },
+            "html": "",
+        })
+
+    def getLatestRegion(self, tag=None):
+        if tag == None:
+            if len(self.regions) > 0:
+                return self.regions[-1]
+            else:
+                return None
+
+        for region in reversed(self.regions):
+            if region["tag"] == tag:
+                return region
+
+        return None
+
+    def appendHtml(self, html):
+        self.regions[-1]["html"] += html
+
+    # ========================================
+    #
+    # HTML helpers.
+
+    def generateHtmlTag(self, tag, inner="", values={}, mode="both"):
+        html = "<"
+        if mode == "end":
+            html += "/"
+
+        html += tag
+
+        for name in sorted(values):
+            if values[name] != None:
+                html += " " + name + "=\"" + values[name] + "\""
+
+        html += ">"
+
+        if mode == "both":
+            html += inner
+            html += "</"
+            html += tag
+            html += ">"
+
+        return html
+
+    # ========================================
+    #
+    # Main markup parsing.
+
+    def parseMarkup(self):
+        # Initial region of "normal" text.
+        self.appendRegion()
+
+        self.tags = {
+            x: {
+                "active": False,
+            } for x in self.TAGS
+        }
+
+        # If the current tag is exclusive.
+        self.exclusive_tag = None
+
+        self.escaped = False
+
+        self.ci = self.metadata_length - 1
+        self.ch = None
+
+        self.empty_line_count = 0
+
+        self.line = ""
+
+        while True:
+            self.ci += 1
+            if self.ci >= len(self.source):
+                break
+
+            self.ch = self.source[self.ci]
+
+            #print(self.ch)
+
+            # Escaping.
+            if self.ch == "\\" and not self.escaped:
+                self.escaped = True
+                continue
+
+            self.escaped = False
+
+            # Newline/whitespace handling.
+            if self.ch == "\n":
+                if self.empty_line_count == 0:
+                    if len(self.getLatestRegion()["html"]) > 0:
+                        self.appendHtml(" ")
+                elif self.empty_line_count == 1:
+                    self.appendRegion()
+
+                self.empty_line_count += 1
+                self.line = ""
+
+                continue
+
+            if self.ch in " \t\r" and self.empty_line_count > 0:
+                continue
+
+            self.empty_line_count = 0
+
+            # Begin tag.
+            tag_begin = self.TAG_BEGINS.get(self.ch)
+            if tag_begin and not self.tags[tag_begin]["active"] and not self.exclusive_tag:
+                self.tags[tag_begin]["active"] = True
+
+                is_region = bool(self.TAGS[tag_begin].get("region"))
+
+                if self.TAGS[tag_begin].get("exclusive"):
+                    self.exclusive_tag = tag_begin
+                if is_region:
+                    self.appendRegion(tag_begin)
+
+                if self.TAGS[tag_begin].get("html_tag") and not is_region:
+                    self.appendHtml(
+                        self.generateHtmlTag(
+                            self.TAGS[tag_begin]["html_tag"],
+                            values={
+                                "class": self.TAGS[tag_begin].get("html_classes"),
+                            },
+                            mode="begin"
+                        )
+                    )
+
+                continue
+
+            # End tag.
+            tag_end = self.TAG_ENDS.get(self.ch)
+            if tag_end and self.tags[tag_end]["active"] and (not self.exclusive_tag or tag_end == self.exclusive_tag):
+                self.tags[tag_end]["active"] = False
+
+                is_region = bool(self.TAGS[tag_end].get("region"))
+
+                if self.TAGS[tag_end].get("html_tag") and not is_region:
+                    self.appendHtml(
+                        self.generateHtmlTag(
+                            self.TAGS[tag_end]["html_tag"],
+                            mode="end"
+                        )
+                    )
+
+                if "end_func" in self.TAGS[tag_end]:
+                    self.TAGS[tag_end]["end_func"](self)
+
+                if self.TAGS[tag_end].get("exclusive"):
+                    self.exclusive_tag = None
+                if is_region:
+                    self.appendRegion()
+
+                continue
+
+            # Insert literal character.
+            if self.ch == "<":
+                self.appendHtml("&lt")
+            elif self.ch == ">":
+                self.appendHtml("&gt")
+            else:
+                self.appendHtml(self.ch)
+
+        # Join HTML regions.
+        for region in self.regions:
+            if not region["export"]:
+                continue
+            if region["html"] == "":
+                continue
+
+            print(region)
+
+            self.html += self.generateHtmlTag(
+                self.TAGS[region["tag"]]["html_tag"],
+                inner=region["html"],
+                values=region["html_values"]
+            )
 
 
 class Generator:
@@ -57,60 +346,216 @@ class Generator:
 
         return t
 
-    def generatePage(self, markup, build_path):
-        template_path = markup.metadata["template"]
-
-        generated = self.getTemplate(template_path).format(
-            title = markup.metadata["title"],
-            description = markup.metadata["description"],
-            author = markup.metadata["author"],
-            date = markup.metadata["date"],
-            body = markup.html,
+    def generateTemplatedHtml(self, source, body="", metadata={}):
+        return source.format(
+            title=metadata.get("title", "None"),
+            author=metadata.get("author", "None"),
+            date=metadata.get("date", "None"),
+            body=body
         )
 
+    def buildMarkupPage(self, markup, build_path):
         f = open(build_path, "w")
-        f.write(generated)
+        f.write(self.generateTemplatedHtml(self.getTemplate(markup.metadata["template"]),
+                                           body=markup.html, metadata=markup.metadata))
+        f.close()
+
+    def buildHtmlPage(self, source, build_path):
+        f = open(build_path, "w")
+        f.write(self.generateTemplatedHtml(source))
         f.close()
 
     def build(self):
         print("Building site...")
 
-        shutil.copytree(self.assets_dir, self.build_dir, dirs_exist_ok=True)
+        shutil.copytree(self.assets_dir, os.path.join(self.build_dir, "assets"), dirs_exist_ok=True)
 
-        # Enumerate .am files in content/.
+        # Enumerate .agm files in content/.
         source_paths = glob.glob(os.path.join(self.content_dir, "**"), recursive=True)
 
         for source_path in source_paths:
             if os.path.isdir(source_path):
                 continue
-            if not source_path.endswith(".am"):
-                continue
 
             print(f"Building {source_path}...")
 
-            build_path = source_path[len(self.content_dir) + 1:]
-            build_path = os.path.join(self.build_dir, build_path)
-            build_path = os.path.splitext(build_path)[0] + ".html"
+            build_path = source_path
+            ext = os.path.splitext(source_path)[1]
 
-            try: os.mkdir(os.path.dirname(build_path))
-            except: pass
+            if ext == ".agm":
+                build_path = build_path[len(self.content_dir) + 1:]
+                build_path = os.path.join(self.build_dir, build_path)
+                build_path = os.path.splitext(build_path)[0] + ".html"
 
-            markup = AmbergenMarkupGenerator(source_path)
+                try: os.mkdir(os.path.dirname(build_path))
+                except: pass
 
-            self.generatePage(markup, build_path)
+                markup = AmbergenMarkupGenerator(source_path)
+
+                self.buildMarkupPage(markup, build_path)
+            elif ext == ".html":
+                f = open(source_path, "r")
+                source = f.read()
+                f.close()
+
+                self.buildHtmlPage(source, build_path)
 
 
-def commandBuild():
-    ag = Generator()
-    ag.build()
+# ========================================
+#
+# Command-line utility usage.
 
 if __name__ == "__main__":
+    SOURCE_DIR = os.path.curdir
+    BUILD_DIR = os.path.join(SOURCE_DIR, "public")
+
+    SERVER_HOSTNAME = "localhost"
+    SERVER_PORT = 8080
+
+    # ========================================
+    #
+    # Helpers.
+
+    def doMakeSourceDir(path):
+        try:
+            os.mkdir(os.path.join(SOURCE_DIR, path))
+        except FileExistsError:
+            pass
+
+    def doMakeSourceFile(path, content=""):
+        try:
+            f = open(os.path.join(SOURCE_DIR, path), "x")
+            f.write(content)
+            f.close()
+        except FileExistsError:
+            pass
+
+    # ========================================
+    #
+    # Commands.
+
+    def commandBuild():
+        ag = Generator(source_dir=SOURCE_DIR, build_dir=BUILD_DIR)
+        ag.build()
+
+    def commandInit():
+        INITIAL_CSS = "\n".join([
+            "",
+            "body {",
+            "  font-family: sans-serif;"
+            "}",
+            "",
+        ])
+
+        INITIAL_AGM_ARTICLE = "\n".join([
+            "",
+            "author Author",
+            "template article.html",
+            "---",
+            "",
+        ])
+
+        INITIAL_HTML_INDEX = "\n".join([
+            "",
+            "<!DOCTYPE html>",
+            "<html lang=\"en\">",
+            "  <head>",
+            "    <meta charset=\"utf-8\" />",
+            "    <title>{title}</title>",
+            "    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />",
+            "    <link rel=\"stylesheet\" href=\"/assets/style/main.css\" />",
+            "  </head>",
+            "  <body>",
+            "    <p>Index</p>",
+            "{listing_articles}",
+            "  </body>",
+            "</html>",
+            "",
+        ])
+
+        INITIAL_HTML_404 = "\n".join([
+            "",
+            "<!DOCTYPE html>",
+            "<html lang=\"en\">",
+            "  <head>",
+            "    <meta charset=\"utf-8\" />",
+            "    <title>{title}</title>",
+            "    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />",
+            "    <link rel=\"stylesheet\" href=\"/assets/style/main.css\" />",
+            "  </head>",
+            "  <body>",
+            "    <div class=\"404-div\"><p class=\"404-text\">404 page not found</p></div>",
+            "  </body>",
+            "</html>",
+            "",
+        ])
+
+        INITIAL_HTML_TEMPLATE = "\n".join([
+            "",
+            "<!DOCTYPE html>",
+            "<html lang=\"en\">",
+            "  <head>",
+            "    <meta charset=\"utf-8\" />",
+            "    <title>{title}</title>",
+            "    <meta name=\"author\" content=\"{author}\" />",
+            "    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />",
+            "    <link rel=\"stylesheet\" href=\"/assets/style/main.css\" />",
+            "  </head>",
+            "  <body>",
+            "{body}",
+            "  </body>",
+            "</html>",
+            "",
+        ])
+
+        doMakeSourceDir("assets")
+        doMakeSourceDir("assets/images")
+        doMakeSourceDir("assets/style")
+        doMakeSourceFile("assets/style/main.css", INITIAL_CSS)
+        doMakeSourceDir("content")
+        doMakeSourceFile("content/index.html", INITIAL_HTML_INDEX)
+        doMakeSourceFile("content/404.html", INITIAL_HTML_404)
+        doMakeSourceDir("content/articles")
+        doMakeSourceDir("content/about")
+        doMakeSourceFile("content/about/index.agm", INITIAL_AGM_ARTICLE)
+        doMakeSourceDir("templates")
+        doMakeSourceFile("templates/article.html", INITIAL_HTML_TEMPLATE)
+
+    def commandServe():
+        from http.server import SimpleHTTPRequestHandler, HTTPServer
+
+        class RequestHandler(SimpleHTTPRequestHandler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, directory=BUILD_DIR, **kwargs)
+
+        print(f"Starting server on {SERVER_HOSTNAME}:{SERVER_PORT}...")
+        server = HTTPServer((SERVER_HOSTNAME, SERVER_PORT), RequestHandler)
+        print("Server started, press Ctrl-C to stop")
+
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+
+        server.server_close()
+        print("Server stopped")
+
+    # ========================================
+    #
+    # Command determination.
+
     if len(sys.argv) > 1:
         COMMAND = sys.argv[1].lower().strip()
     else:
         COMMAND = "build"
 
+    # Run command.
     if COMMAND == "build":
         commandBuild()
+    elif COMMAND == "init":
+        commandInit()
+    elif COMMAND == "serve":
+        commandBuild()
+        commandServe()
     else:
         print(f"Unknown command '{COMMAND}'")
