@@ -1,10 +1,141 @@
 #! /bin/env python3
 
+import collections
 import enum
 import glob
 import os
 import shutil
 import sys
+
+
+class AmbergenMarkupTagDefinition:
+
+    def __init__(self, export_mode='AUTO', begin=None, end=None,
+                 is_region=False, is_exclusive=False, preserve=False,
+                 html_mode='BOTH', html_tag=None, html_values={},
+                 end_func=None):
+
+        self.export_mode = export_mode
+
+        self.begin = begin
+        self.end = end
+
+        # Create a new region for this tag.
+        self.is_region = is_region
+
+        # Only this tag's end sequence will be recognized.
+        self.is_exclusive = is_exclusive
+
+        # If this tag ends upon a newline.
+        self.is_single_line = begin and not end
+
+        # If all characters (namely whitespace) are preserved for this
+        # tag.
+        self.preserve = preserve
+
+        self.html_mode = html_mode
+        self.html_tag = html_tag
+        self.html_values = html_values
+
+        self.end_func = end_func
+
+    def callEndFunc(self, generator):
+        if self.end_func:
+            self.end_func(generator)
+
+    def shouldExport(self, inner=None):
+        if self.export_mode == 'NEVER':
+            return False
+        elif self.export_mode == 'AUTO' and inner == "":
+            return False
+
+        return True
+
+    def canPrune(self, inner=None):
+        return (self.export_mode == 'AUTO' or self.export_mode == 'PRUNE') and inner == ""
+
+    def export(self, inner=None, values=None, html_mode=None):
+        if not self.shouldExport(inner):
+            return ""
+
+        values = values or self.html_values
+        html_mode = html_mode or self.html_mode
+
+        html = ""
+
+        # Begin tag.
+        if self.html_tag and html_mode in ['BOTH', 'BEGIN', 'SINGLE']:
+            html += "<" + self.html_tag
+
+            for name in sorted(values):
+                if values[name] != None:
+                    html += " " + name + "=\"" + values[name] + "\""
+
+            html += "/>" if self.html_mode == 'SINGLE' else ">"
+
+        # Inner.
+        if inner:
+            html += inner
+
+        # End tag.
+        if self.html_tag and html_mode in ['BOTH', 'END'] and self.html_mode != 'SINGLE':
+            html += "</" + self.html_tag + ">"
+
+        return html
+
+
+class AmbergenMarkupRegion:
+
+    def __init__(self, tag_name, definition, inner=""):
+        self.tag_name = tag_name
+        self.definition = definition
+
+        self.inner = inner
+        self.values = self.definition.html_values.copy()
+
+        self.prune = False
+
+    def __str__(self):
+        s = {
+            "tag_name": self.tag_name,
+            "inner": self.inner,
+            "values": self.values,
+        }
+
+        return str(s)
+
+    def prependInner(self, text):
+        self.inner = text + self.inner
+
+    def appendInner(self, text):
+        self.inner += text
+
+    def hasInner(self):
+        return self.inner != ""
+
+    def shouldExport(self):
+        return self.definition.shouldExport(self.inner)
+
+    def canPrune(self, previous_region=None, next_region=None):
+        return self.definition.canPrune(self.inner)
+
+    def checkPrune(self, previous_region=None, next_region=None):
+        if not self.canPrune():
+            return
+
+        if previous_region and previous_region.canPrune():
+            if previous_region.definition.html_tag == self.definition.html_tag:
+                if previous_region.definition.html_mode == 'BEGIN' and self.definition.html_mode == 'END':
+                    self.prune = True
+                    return
+
+        if next_region and next_region.canPrune():
+            if next_region.definition.html_tag == self.definition.html_tag:
+                if self.definition.html_mode == 'BEGIN' and next_region.definition.html_mode == 'END':
+                    self.prune = True
+
+    def export(self):
+        return self.definition.export(inner=self.inner, values=self.values)
 
 
 class AmbergenMarkupGenerator:
@@ -13,78 +144,104 @@ class AmbergenMarkupGenerator:
     #
     # Tag callback functions.
 
-    def tagLinkUrlEnd(self):
-        latest_region = self.getLatestRegion()
-        latest_region["export"] = False
+    def tagBlockEnd(generator):
+        generator.appendRegion("paragraph_end", offset=1)
+        generator.appendRegion("paragraph")
 
-        self.getLatestRegion("link")["html_values"]["href"] = latest_region["html"]
+    def tagLinkUrlEnd(generator):
+        url_region = generator.getRegion()
+        link_region = generator.getRegion(["link", "embed_image", "embed_image_pixel", "embed_image_small"])
+
+        if link_region.definition.html_tag == "img":
+            link_region.values["src"] = url_region.inner
+            link_region.values["alt"] = link_region.inner
+
+            link_region.inner = ""
+        else:
+            link_region.values["href"] = url_region.inner
 
     # ========================================
     #
     # Tag definition table.
 
-    TAGS = {
-        "normal": {
-            "begin": "None",
-            "end": "None",
-            "html_tag": "p",
-        },
-        "italic": {
-            "begin": "/",
-            "end": "/",
-            "html_tag": "em",
-            "html_classes": "markup-italic",
-        },
-        "bold": {
-            "begin": "*",
-            "end": "*",
-            "html_tag": "strong",
-            "html_classes": "markup-bold",
-        },
-        "underline": {
-            "begin": "_",
-            "end": "_",
-            "html_tag": "span",
-            "html_classes": "markup-underline",
-        },
-        "strikethrough": {
-            "begin": "~",
-            "end": "~",
-            "html_tag": "span",
-            "html_classes": "markup-strikethrough",
-        },
-        "code": {
-            "begin": "`",
-            "end": "`",
-            "exclusive": True,
-            "html_tag": "code",
-            "html_classes": "markup-code",
-        },
-        "link": {
-            "begin": "[",
-            "end": "]",
-            "region": True,
-            "html_tag": "a",
-            "html_classes": "markup-link",
-        },
-        "link_url": {
-            "begin": "(",
-            "end": ")",
-            "exclusive": True,
-            "region": True,
-            "end_func": tagLinkUrlEnd,
-        },
+    TAG_DEFINITIONS = {
+        "paragraph": AmbergenMarkupTagDefinition(
+            export_mode='PRUNE',
+            html_mode='BEGIN', html_tag="p",
+        ),
+        "paragraph_end": AmbergenMarkupTagDefinition(
+            export_mode='PRUNE',
+            html_mode='END', html_tag="p"
+        ),
+        "normal": AmbergenMarkupTagDefinition(),
+        "heading": AmbergenMarkupTagDefinition(
+            begin="#",
+            is_region=True,
+            html_tag="h2",
+            end_func=tagBlockEnd
+        ),
+        "italic": AmbergenMarkupTagDefinition(
+            begin="/", end="/",
+            html_tag="em"
+        ),
+        "bold": AmbergenMarkupTagDefinition(
+            begin="*", end="*",
+            html_tag="strong"
+        ),
+        "underline": AmbergenMarkupTagDefinition(
+            begin="_", end="_",
+            html_tag="span", html_values={ "class": "underline" }
+        ),
+        "strikethrough": AmbergenMarkupTagDefinition(
+            begin="~", end="~",
+            html_tag="span", html_values={ "class": "strikethrough" }
+        ),
+        "code_block": AmbergenMarkupTagDefinition(
+            begin="```", end="```",
+            is_region=True, is_exclusive=True, preserve=True,
+            html_tag="pre", html_values={ "class": "code-block" },
+            end_func=tagBlockEnd
+        ),
+        "code_inline": AmbergenMarkupTagDefinition(
+            begin="`", end="`",
+            is_exclusive=True,
+            html_tag="code", html_values={ "class": "code-inline" }
+        ),
+        "embed_image": AmbergenMarkupTagDefinition(
+            export_mode='ALWAYS', begin="![", end="]",
+            is_region=True,
+            html_mode='SINGLE', html_tag="img", html_values={ "class": "embed" },
+            end_func=tagBlockEnd
+        ),
+        "embed_image_small": AmbergenMarkupTagDefinition(
+            export_mode='ALWAYS', begin="!small[", end="]",
+            is_region=True,
+            html_mode='SINGLE', html_tag="img", html_values={ "class": "embed-small" }
+        ),
+        "embed_image_pixel": AmbergenMarkupTagDefinition(
+            export_mode='ALWAYS', begin="!pixel[", end="]",
+            is_region=True,
+            html_mode='SINGLE', html_tag="img", html_values={ "class": "embed image-pixel" },
+            end_func=tagBlockEnd
+        ),
+        "link": AmbergenMarkupTagDefinition(
+            begin="[", end="]",
+            is_region=True,
+            html_tag="a"
+        ),
+        "link_url": AmbergenMarkupTagDefinition(
+            export_mode='NEVER', begin="(", end=")",
+            is_region=True, is_exclusive=True,
+            end_func=tagLinkUrlEnd
+        ),
     }
 
     # ========================================
     #
     # Constructor.
 
-    def __init__(self, path, only_metadata=False):
-        self.TAG_BEGINS = { self.TAGS[x]["begin"]: x for x in self.TAGS }
-        self.TAG_ENDS = { self.TAGS[x]["end"]: x for x in self.TAGS }
-
-        self.path = path
+    def __init__(self, source_path, only_metadata=False):
+        self.source_path = source_path
         self.only_metadata = only_metadata
 
         self.metadata_length = 0
@@ -107,7 +264,7 @@ class AmbergenMarkupGenerator:
     # Preliminary metadata parsing.
 
     def parse(self):
-        f = open(self.path, "r")
+        f = open(self.source_path, "r")
         self.source = f.read()
         f.close()
 
@@ -115,6 +272,7 @@ class AmbergenMarkupGenerator:
 
         if not self.only_metadata:
             self.parseMarkup()
+            self.export()
 
     def parseMetadata(self):
         SEPARATOR = "---"
@@ -137,72 +295,92 @@ class AmbergenMarkupGenerator:
     #
     # Region.
 
-    def appendRegion(self, tag="normal"):
-        self.regions.append({
-            "export": True,
-            "tag": tag,
-            "html_values": {
-                "class": self.TAGS[tag].get("html_classes"),
-            },
-            "html": "",
-        })
+    def appendRegion(self, tag_name="normal", offset=0):
+        index = max(len(self.regions) - offset, 0)
 
-    def getLatestRegion(self, tag=None):
-        if tag == None:
+        # Remove empty regions.
+        index_p = index - 1
+        if index_p >= 0:
+            region = self.regions[index_p]
+            if region and not region.shouldExport():
+                del self.regions[index_p]
+                index = max(index - 1, 0)
+
+        self.regions.insert(index, AmbergenMarkupRegion(tag_name, self.TAG_DEFINITIONS[tag_name]))
+
+        return self.regions[index]
+
+    def deleteRegion(self, region):
+        del region
+
+    def getRegion(self, tag_names=None, offset=0):
+        if not tag_names:
             if len(self.regions) > 0:
-                return self.regions[-1]
+                return self.regions[-(offset + 1)]
             else:
                 return None
 
-        for region in reversed(self.regions):
-            if region["tag"] == tag:
+        for i in range(len(self.regions) - (offset + 1), 0, -1):
+            region = self.regions[i]
+            if region.tag_name in tag_names:
                 return region
 
         return None
 
-    def appendHtml(self, html):
-        self.regions[-1]["html"] += html
+    def prependInner(self, html, region=None):
+        region = region or self.regions[-1]
+        region.prependInner(text)
+
+    def appendInner(self, text, region=None):
+        region = region or self.regions[-1]
+        region.appendInner(text)
 
     # ========================================
     #
-    # HTML helpers.
+    # Tag.
 
-    def generateHtmlTag(self, tag, inner="", values={}, mode="both"):
-        html = "<"
-        if mode == "end":
-            html += "/"
+    def beginTag(self, tag_name):
+        self.active_tags[tag_name] = True
 
-        html += tag
+        tag = self.TAG_DEFINITIONS[tag_name]
 
-        for name in sorted(values):
-            if values[name] != None:
-                html += " " + name + "=\"" + values[name] + "\""
+        if tag.is_exclusive:
+            self.exclusive_tag = tag_name
 
-        html += ">"
+        if tag.is_region:
+            self.appendRegion(tag_name)
+        else:
+            self.appendInner(tag.export(html_mode='BEGIN'))
 
-        if mode == "both":
-            html += inner
-            html += "</"
-            html += tag
-            html += ">"
+    def endTag(self, tag_name):
+        self.active_tags[tag_name] = False
 
-        return html
+        tag = self.TAG_DEFINITIONS[tag_name]
+
+        tag.callEndFunc(self)
+
+        if tag.is_exclusive:
+            self.exclusive_tag = None
+
+        if tag.is_region:
+            self.appendRegion()
+        else:
+            self.appendInner(tag.export(html_mode='END'))
 
     # ========================================
     #
     # Main markup parsing.
 
+    def nextCh(self, count=1):
+        self.ci += count
+        if self.ci >= len(self.source):
+            return False
+
+        self.ch = self.source[self.ci]
+        return True
+
     def parseMarkup(self):
-        # Initial region of "normal" text.
-        self.appendRegion()
-
-        self.tags = {
-            x: {
-                "active": False,
-            } for x in self.TAGS
-        }
-
-        # If the current tag is exclusive.
+        self.active_tags = { x: False for x in self.TAG_DEFINITIONS }
         self.exclusive_tag = None
 
         self.escaped = False
@@ -211,115 +389,120 @@ class AmbergenMarkupGenerator:
         self.ch = None
 
         self.empty_line_count = 0
+        self.column = 0
 
-        self.line = ""
+        self.appendRegion("paragraph")
 
-        while True:
-            self.ci += 1
-            if self.ci >= len(self.source):
-                break
+        while self.nextCh():
+            latest_region = self.getRegion()
 
-            self.ch = self.source[self.ci]
+            if not latest_region.definition.preserve:
+                # Escaping.
+                if self.ch == "\\" and not self.escaped:
+                    self.escaped = True
+                    continue
 
-            #print(self.ch)
+                self.escaped = False
 
-            # Escaping.
-            if self.ch == "\\" and not self.escaped:
-                self.escaped = True
+                # Newline/whitespace handling.
+                if self.ch == "\n":
+                    if self.empty_line_count == 0 and latest_region.hasInner():
+                        self.appendInner(" ")
+                    elif self.empty_line_count == 1:
+                        self.appendRegion("paragraph_end")
+                        self.appendRegion("paragraph")
+
+                    self.empty_line_count += 1
+                    self.column = 0
+
+                    # Handle single-line tags.
+                    for tag_name in self.TAG_DEFINITIONS:
+                        if self.active_tags[tag_name] and self.TAG_DEFINITIONS[tag_name].is_single_line:
+                            self.endTag(tag_name)
+
+                    continue
+
+                # Whitespace is ignored.
+                if self.ch in " \t\r" and self.empty_line_count > 0:
+                    column = 0
+                    continue
+
+                self.empty_line_count = 0
+                self.column += 1
+
+                if self.column == 1:
+                    if self.source.startswith("---", self.ci):
+                        self.nextCh(2)
+                        self.appendInner("<hr>")
+                        continue
+
+            # Begin tags.
+            tag_begin = None
+            tag_begin_name = None
+            for tag_name in self.TAG_DEFINITIONS:
+                tag = self.TAG_DEFINITIONS[tag_name]
+                if not self.active_tags[tag_name] and tag.begin and self.source.startswith(tag.begin, self.ci):
+                    tag_begin = tag
+                    tag_begin_name = tag_name
+                    break
+
+            if tag_begin and not self.exclusive_tag:
+                self.nextCh(len(tag_begin.begin) - 1)
+                self.beginTag(tag_begin_name)
                 continue
 
-            self.escaped = False
+            # End tags.
+            tag_end = None
+            tag_end_name = None
+            for tag_name in self.TAG_DEFINITIONS:
+                tag = self.TAG_DEFINITIONS[tag_name]
+                if self.active_tags[tag_name] and tag.end and self.source.startswith(tag.end, self.ci):
+                    tag_end = tag
+                    tag_end_name = tag_name
+                    break
 
-            # Newline/whitespace handling.
-            if self.ch == "\n":
-                if self.empty_line_count == 0:
-                    if len(self.getLatestRegion()["html"]) > 0:
-                        self.appendHtml(" ")
-                elif self.empty_line_count == 1:
-                    self.appendRegion()
-
-                self.empty_line_count += 1
-                self.line = ""
-
-                continue
-
-            if self.ch in " \t\r" and self.empty_line_count > 0:
-                continue
-
-            self.empty_line_count = 0
-
-            # Begin tag.
-            tag_begin = self.TAG_BEGINS.get(self.ch)
-            if tag_begin and not self.tags[tag_begin]["active"] and not self.exclusive_tag:
-                self.tags[tag_begin]["active"] = True
-
-                is_region = bool(self.TAGS[tag_begin].get("region"))
-
-                if self.TAGS[tag_begin].get("exclusive"):
-                    self.exclusive_tag = tag_begin
-                if is_region:
-                    self.appendRegion(tag_begin)
-
-                if self.TAGS[tag_begin].get("html_tag") and not is_region:
-                    self.appendHtml(
-                        self.generateHtmlTag(
-                            self.TAGS[tag_begin]["html_tag"],
-                            values={
-                                "class": self.TAGS[tag_begin].get("html_classes"),
-                            },
-                            mode="begin"
-                        )
-                    )
-
-                continue
-
-            # End tag.
-            tag_end = self.TAG_ENDS.get(self.ch)
-            if tag_end and self.tags[tag_end]["active"] and (not self.exclusive_tag or tag_end == self.exclusive_tag):
-                self.tags[tag_end]["active"] = False
-
-                is_region = bool(self.TAGS[tag_end].get("region"))
-
-                if self.TAGS[tag_end].get("html_tag") and not is_region:
-                    self.appendHtml(
-                        self.generateHtmlTag(
-                            self.TAGS[tag_end]["html_tag"],
-                            mode="end"
-                        )
-                    )
-
-                if "end_func" in self.TAGS[tag_end]:
-                    self.TAGS[tag_end]["end_func"](self)
-
-                if self.TAGS[tag_end].get("exclusive"):
-                    self.exclusive_tag = None
-                if is_region:
-                    self.appendRegion()
-
+            if tag_end and (not self.exclusive_tag or tag_end_name == self.exclusive_tag):
+                self.nextCh(len(tag_end.end) - 1)
+                self.endTag(tag_end_name)
                 continue
 
             # Insert literal character.
             if self.ch == "<":
-                self.appendHtml("&lt")
+                self.appendInner("&lt")
             elif self.ch == ">":
-                self.appendHtml("&gt")
+                self.appendInner("&gt")
             else:
-                self.appendHtml(self.ch)
+                self.appendInner(self.ch)
 
-        # Join HTML regions.
+        self.appendRegion("paragraph_end")
+
+    def export(self):
+        # Prune empty tags.
+        for i in range(len(self.regions)):
+            region = self.regions[i]
+
+            if not region.shouldExport():
+                continue
+
+            if i > 0: previous_region = self.regions[i - 1]
+            else: previous_region = None
+
+            if i < (len(self.regions) - 1): next_region = self.regions[i + 1]
+            else: next_region = None
+
+            region.checkPrune(previous_region, next_region)
+
+        # Export regions.
         for region in self.regions:
-            if not region["export"]:
-                continue
-            if region["html"] == "":
+            if not region.shouldExport():
                 continue
 
-            print(region)
+            if region.prune:
+                continue
 
-            self.html += self.generateHtmlTag(
-                self.TAGS[region["tag"]]["html_tag"],
-                inner=region["html"],
-                values=region["html_values"]
-            )
+            #print(region)
+
+            self.html += region.export()
 
 
 class Generator:
@@ -409,7 +592,7 @@ if __name__ == "__main__":
     SOURCE_DIR = os.path.curdir
     BUILD_DIR = os.path.join(SOURCE_DIR, "public")
 
-    SERVER_HOSTNAME = "localhost"
+    SERVER_HOSTNAME = "0.0.0.0"
     SERVER_PORT = 8080
 
     # ========================================
