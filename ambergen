@@ -13,7 +13,7 @@ class AmbergenMarkupTagDefinition:
     def __init__(self, export_mode='AUTO', begin=None, end=None,
                  is_region=False, is_exclusive=False, preserve=False,
                  html_mode='BOTH', html_tag=None, html_values={},
-                 end_func=None):
+                 begin_func=None, end_func=None):
 
         self.export_mode = export_mode
 
@@ -37,7 +37,12 @@ class AmbergenMarkupTagDefinition:
         self.html_tag = html_tag
         self.html_values = html_values
 
+        self.begin_func = begin_func
         self.end_func = end_func
+
+    def callBeginFunc(self, generator, indent=0):
+        if self.begin_func:
+            self.begin_func(generator, indent)
 
     def callEndFunc(self, generator):
         if self.end_func:
@@ -166,6 +171,19 @@ class AmbergenMarkupGenerator:
         else:
             region.values["href"] = url_region.inner
 
+    def tagListItemBegin(generator, indent):
+        diff = indent - generator.list_depth
+
+        if diff > 0:
+            for i in range(diff):
+                generator.appendInner("<ul>")
+        elif diff < 0:
+            for i in range(-diff):
+                generator.appendInner("</ul>")
+
+        generator.list_depth += diff
+
+
     # ========================================
     #
     # Tag definition table.
@@ -263,6 +281,14 @@ class AmbergenMarkupGenerator:
             export_mode='NEVER', begin="(", end=")",
             is_region=True, is_exclusive=True,
             end_func=tagUrlEnd
+        ),
+
+        # Lists.
+
+        "list_item": AmbergenMarkupTagDefinition(
+            begin="-",
+            html_tag="li",
+            begin_func=tagListItemBegin,
         ),
     }
 
@@ -379,7 +405,9 @@ class AmbergenMarkupGenerator:
 
         if tag.is_region:
             self.appendRegion(tag_name)
+            tag.callBeginFunc(self, self.line_indent // 2)
         else:
+            tag.callBeginFunc(self, self.line_indent // 2)
             self.appendInner(tag.export(html_mode='BEGIN'))
 
     def endTag(self, tag_name):
@@ -387,15 +415,16 @@ class AmbergenMarkupGenerator:
 
         tag = self.TAG_DEFINITIONS[tag_name]
 
-        tag.callEndFunc(self)
-
         if tag.is_exclusive:
             self.exclusive_tag = None
 
         if tag.is_region:
+            tag.callEndFunc(self)
             self.appendRegion()
         else:
             self.appendInner(tag.export(html_mode='END'))
+            tag.callEndFunc(self)
+
 
     # ========================================
     #
@@ -413,37 +442,50 @@ class AmbergenMarkupGenerator:
         self.active_tags = { x: False for x in self.TAG_DEFINITIONS }
         self.exclusive_tag = None
 
-        self.escaped = False
+        self.escape = -1
 
         self.ci = self.metadata_length - 1
         self.ch = None
 
         self.empty_line_count = 0
-        self.column = 0
+        # How many non-whitespace characters in this line so far.
+        self.line_solid = 0
+        # Indent spaces. tab = 2, space = 1. Do `line_indent // 2` for
+        # the actual indent level.
+        self.line_indent = 0
+
+        self.list_depth = -1
 
         self.appendRegion("paragraph")
 
         while self.nextCh():
             latest_region = self.getRegion()
 
+            if self.escape >= 0:
+                self.escape -= 1
+
             if not latest_region.definition.preserve:
                 # Escaping.
-                if self.ch == "\\" and not self.escaped:
-                    self.escaped = True
+                if self.ch == "\\" and self.escape < 0:
+                    self.escape = 1
                     continue
-
-                self.escaped = False
 
                 # Newline/whitespace handling.
                 if self.ch == "\n":
                     if self.empty_line_count == 0 and latest_region.hasInner():
                         self.appendInner(" ")
                     elif self.empty_line_count == 1:
+                        if self.list_depth >= 0:
+                            self.tagListItemBegin(-1)
+                            self.list_depth = -1
+
                         self.appendRegion("paragraph_end")
                         self.appendRegion("paragraph")
 
                     self.empty_line_count += 1
                     self.column = 0
+                    self.line_solid = 0
+                    self.line_indent = 0
 
                     # Handle single-line tags.
                     for tag_name in self.TAG_DEFINITIONS:
@@ -454,47 +496,58 @@ class AmbergenMarkupGenerator:
 
                 # Whitespace is ignored.
                 if self.ch in " \t\r" and self.empty_line_count > 0:
-                    column = 0
+                    self.column = 0
+
+                    if self.ch == " ":
+                        self.line_indent += 1
+                    elif self.ch == "\t":
+                        self.line_indent += 2
+
                     continue
 
+                self.line_solid += 1
                 self.empty_line_count = 0
-                self.column += 1
 
-                if self.column == 1:
+                if self.line_solid == 1:
                     if self.source.startswith("---", self.ci):
                         self.nextCh(2)
                         self.appendInner("<hr>")
                         continue
 
-            # Begin tags.
-            tag_begin = None
-            tag_begin_name = None
-            for tag_name in self.TAG_DEFINITIONS:
-                tag = self.TAG_DEFINITIONS[tag_name]
-                if not self.active_tags[tag_name] and tag.begin and self.source.startswith(tag.begin, self.ci):
-                    tag_begin = tag
-                    tag_begin_name = tag_name
-                    break
+            if self.escape < 0:
+                # Begin tags.
+                tag_begin = None
+                tag_begin_name = None
+                for tag_name in self.TAG_DEFINITIONS:
+                    tag = self.TAG_DEFINITIONS[tag_name]
 
-            if tag_begin and not self.exclusive_tag:
-                self.nextCh(len(tag_begin.begin) - 1)
-                self.beginTag(tag_begin_name)
-                continue
+                    if tag.is_single_line and self.line_solid > 1:
+                        continue
 
-            # End tags.
-            tag_end = None
-            tag_end_name = None
-            for tag_name in self.TAG_DEFINITIONS:
-                tag = self.TAG_DEFINITIONS[tag_name]
-                if self.active_tags[tag_name] and tag.end and self.source.startswith(tag.end, self.ci):
-                    tag_end = tag
-                    tag_end_name = tag_name
-                    break
+                    if not self.active_tags[tag_name] and tag.begin and self.source.startswith(tag.begin, self.ci):
+                        tag_begin = tag
+                        tag_begin_name = tag_name
+                        break
 
-            if tag_end and (not self.exclusive_tag or tag_end_name == self.exclusive_tag):
-                self.nextCh(len(tag_end.end) - 1)
-                self.endTag(tag_end_name)
-                continue
+                if tag_begin and not self.exclusive_tag:
+                    self.nextCh(len(tag_begin.begin) - 1)
+                    self.beginTag(tag_begin_name)
+                    continue
+
+                # End tags.
+                tag_end = None
+                tag_end_name = None
+                for tag_name in self.TAG_DEFINITIONS:
+                    tag = self.TAG_DEFINITIONS[tag_name]
+                    if self.active_tags[tag_name] and tag.end and self.source.startswith(tag.end, self.ci):
+                        tag_end = tag
+                        tag_end_name = tag_name
+                        break
+
+                if tag_end and (not self.exclusive_tag or tag_end_name == self.exclusive_tag):
+                    self.nextCh(len(tag_end.end) - 1)
+                    self.endTag(tag_end_name)
+                    continue
 
             # Insert literal character.
             if self.ch == "<":
