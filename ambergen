@@ -93,8 +93,6 @@ class AmbergenMarkupRegion:
         self.inner = inner
         self.values = self.definition.html_values.copy()
 
-        self.prune = False
-
     def __str__(self):
         s = {
             "tag_name": self.tag_name,
@@ -121,18 +119,19 @@ class AmbergenMarkupRegion:
 
     def checkPrune(self, previous_region=None, next_region=None):
         if not self.canPrune():
-            return
+            return False
 
         if previous_region and previous_region.canPrune():
             if previous_region.definition.html_tag == self.definition.html_tag:
                 if previous_region.definition.html_mode == 'BEGIN' and self.definition.html_mode == 'END':
-                    self.prune = True
-                    return
+                    return True
 
         if next_region and next_region.canPrune():
             if next_region.definition.html_tag == self.definition.html_tag:
                 if self.definition.html_mode == 'BEGIN' and next_region.definition.html_mode == 'END':
-                    self.prune = True
+                    return True
+
+        return False
 
     def export(self):
         return self.definition.export(inner=self.inner, values=self.values)
@@ -148,23 +147,34 @@ class AmbergenMarkupGenerator:
         generator.appendRegion("paragraph_end", offset=1)
         generator.appendRegion("paragraph")
 
-    def tagLinkUrlEnd(generator):
+    def tagHeadingEnd(generator):
+        generator.appendRegion("paragraph_end", offset=1)
+        generator.appendRegion("section_end", offset=1)
+        generator.appendRegion("section_begin", offset=1)
+        generator.appendRegion("paragraph")
+
+    def tagUrlEnd(generator):
         url_region = generator.getRegion()
-        link_region = generator.getRegion(["link", "embed_image", "embed_image_pixel", "embed_image_small"])
+        region = generator.getRegion(["link", "embed_image", "embed_image_pixel", "embed_image_small"])
 
-        if link_region.definition.html_tag == "img":
-            link_region.values["src"] = url_region.inner
-            link_region.values["alt"] = link_region.inner
+        if region.definition.html_tag == "img":
+            region.values["src"] = url_region.inner
+            region.values["alt"] = region.inner
 
-            link_region.inner = ""
+            if region.tag_name != "embed_image_small":
+                region.inner = "<span class=\"embed-caption\"><em>" + region.inner + "</em></span>"
         else:
-            link_region.values["href"] = url_region.inner
+            region.values["href"] = url_region.inner
 
     # ========================================
     #
     # Tag definition table.
 
     TAG_DEFINITIONS = {
+        "normal": AmbergenMarkupTagDefinition(),
+
+        # Paragraph.
+
         "paragraph": AmbergenMarkupTagDefinition(
             export_mode='PRUNE',
             html_mode='BEGIN', html_tag="p",
@@ -173,13 +183,29 @@ class AmbergenMarkupGenerator:
             export_mode='PRUNE',
             html_mode='END', html_tag="p"
         ),
-        "normal": AmbergenMarkupTagDefinition(),
+
+        # Section.
+
+        "section_begin": AmbergenMarkupTagDefinition(
+            export_mode='ALWAYS',
+            html_mode='BEGIN', html_tag="section",
+        ),
+        "section_end": AmbergenMarkupTagDefinition(
+            export_mode='ALWAYS',
+            html_mode='END', html_tag="section"
+        ),
+
+        # Heading.
+
         "heading": AmbergenMarkupTagDefinition(
             begin="#",
             is_region=True,
             html_tag="h2",
-            end_func=tagBlockEnd
+            end_func=tagHeadingEnd
         ),
+
+        # Styling.
+
         "italic": AmbergenMarkupTagDefinition(
             begin="/", end="/",
             html_tag="em"
@@ -188,51 +214,55 @@ class AmbergenMarkupGenerator:
             begin="*", end="*",
             html_tag="strong"
         ),
-        "underline": AmbergenMarkupTagDefinition(
-            begin="_", end="_",
-            html_tag="span", html_values={ "class": "underline" }
-        ),
-        "strikethrough": AmbergenMarkupTagDefinition(
-            begin="~", end="~",
-            html_tag="span", html_values={ "class": "strikethrough" }
-        ),
+
+        # Code.
+
         "code_block": AmbergenMarkupTagDefinition(
             begin="```", end="```",
             is_region=True, is_exclusive=True, preserve=True,
-            html_tag="pre", html_values={ "class": "code-block" },
+            html_tag="pre", html_values={ "class": "code-block", },
             end_func=tagBlockEnd
         ),
         "code_inline": AmbergenMarkupTagDefinition(
             begin="`", end="`",
             is_exclusive=True,
-            html_tag="code", html_values={ "class": "code-inline" }
+            html_tag="code", html_values={ "class": "code-inline", }
         ),
+
+        # Embeds.
+
         "embed_image": AmbergenMarkupTagDefinition(
             export_mode='ALWAYS', begin="![", end="]",
-            is_region=True,
-            html_mode='SINGLE', html_tag="img", html_values={ "class": "embed" },
+            is_region=True, is_exclusive=True,
+            html_mode='SINGLE', html_tag="img", html_values={ "class": "embed", },
             end_func=tagBlockEnd
         ),
         "embed_image_small": AmbergenMarkupTagDefinition(
             export_mode='ALWAYS', begin="!small[", end="]",
-            is_region=True,
-            html_mode='SINGLE', html_tag="img", html_values={ "class": "embed-small" }
+            is_region=True, is_exclusive=True,
+            html_mode='SINGLE', html_tag="img", html_values={ "class": "embed-small", }
         ),
         "embed_image_pixel": AmbergenMarkupTagDefinition(
             export_mode='ALWAYS', begin="!pixel[", end="]",
-            is_region=True,
-            html_mode='SINGLE', html_tag="img", html_values={ "class": "embed image-pixel" },
+            is_region=True, is_exclusive=True,
+            html_mode='SINGLE', html_tag="img", html_values={ "class": "embed image-pixel", },
             end_func=tagBlockEnd
         ),
+
+        # Links.
+
         "link": AmbergenMarkupTagDefinition(
             begin="[", end="]",
-            is_region=True,
+            is_region=True, is_exclusive=True,
             html_tag="a"
         ),
-        "link_url": AmbergenMarkupTagDefinition(
+
+        # URL specifier.
+
+        "url": AmbergenMarkupTagDefinition(
             export_mode='NEVER', begin="(", end=")",
             is_region=True, is_exclusive=True,
-            end_func=tagLinkUrlEnd
+            end_func=tagUrlEnd
         ),
     }
 
@@ -477,31 +507,40 @@ class AmbergenMarkupGenerator:
         self.appendRegion("paragraph_end")
 
     def export(self):
-        # Prune empty tags.
+        tag_counts = {}
+
         for i in range(len(self.regions)):
             region = self.regions[i]
 
             if not region.shouldExport():
                 continue
 
+            # Check if region should be pruned.
             if i > 0: previous_region = self.regions[i - 1]
             else: previous_region = None
 
             if i < (len(self.regions) - 1): next_region = self.regions[i + 1]
             else: next_region = None
 
-            region.checkPrune(previous_region, next_region)
-
-        # Export regions.
-        for region in self.regions:
-            if not region.shouldExport():
+            if region.checkPrune(previous_region, next_region):
                 continue
 
-            if region.prune:
-                continue
+            # Prune unnecessary `END` tags.
+            html_tag = region.definition.html_tag
+            if region.definition.html_mode == 'BEGIN':
+                if html_tag in tag_counts:
+                    tag_counts[html_tag] += 1
+                else:
+                    tag_counts[html_tag] = 0
+            elif region.definition.html_mode == 'END':
+                if not html_tag in tag_counts or tag_counts[html_tag] < 1:
+                    tag_counts[html_tag] = 0
+                    continue
+                else:
+                    tag_counts[html_tag] -= 1
 
-            #print(region)
-
+            # Export region.
+            print(region)
             self.html += region.export()
 
 
