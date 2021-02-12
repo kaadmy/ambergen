@@ -1,11 +1,30 @@
 #! /bin/env python3
 
-import collections
 import enum
 import glob
 import os
+import re
 import shutil
 import sys
+
+
+def generateSlug(text, replacement="-"):
+    text = re.sub("[^a-zA-Z0-9]", replacement, text)
+    text = re.sub(replacement + "{1,}", replacement, text)
+    text = text.strip(replacement)
+    return text.lower()
+
+
+def parseDate(iso):
+    MONTHS = ["January", "Febuary", "March", "April", "May", "June", "July", "August", "October", "November", "December"]
+
+    d = [int(x) for x in iso.split("-")]
+    return (tuple(d), f"{MONTHS[d[1] - 1]} {d[2]}, {d[0]}")
+
+
+# ========================================
+#
+# Ambergen markup.
 
 
 class AmbergenMarkupTagDefinition:
@@ -152,7 +171,19 @@ class AmbergenMarkupGenerator:
         generator.appendRegion("paragraph_end", offset=1)
         generator.appendRegion("paragraph")
 
+    def tagHeadingBegin(generator, indent):
+        heading_end = generator.source.find("\n", generator.ci)
+        if heading_end == -1:
+            heading_end = len(generator.source) - 1
+
+        slug = generator.source[generator.ci:heading_end]
+        slug = generateSlug(slug)
+
+        generator.appendInner("<a id=\"" + slug + "\" href=\"#" + slug + "\">")
+
     def tagHeadingEnd(generator):
+        generator.appendInner("</a>")
+
         generator.appendRegion("paragraph_end", offset=1)
         generator.appendRegion("section_end", offset=1)
         generator.appendRegion("section_begin", offset=1)
@@ -218,8 +249,8 @@ class AmbergenMarkupGenerator:
         "heading": AmbergenMarkupTagDefinition(
             begin="#",
             is_region=True,
-            html_tag="h2",
-            end_func=tagHeadingEnd
+            html_tag="h2", html_values={ "class": "heading", },
+            begin_func=tagHeadingBegin, end_func=tagHeadingEnd
         ),
 
         # Styling.
@@ -272,7 +303,7 @@ class AmbergenMarkupGenerator:
         "link": AmbergenMarkupTagDefinition(
             begin="[", end="]",
             is_region=True, is_exclusive=True,
-            html_tag="a"
+            html_tag="a", html_values = { "class": "link" }
         ),
 
         # URL specifier.
@@ -304,9 +335,12 @@ class AmbergenMarkupGenerator:
         self.metadata = {
             "title": "Title",
             "author": "Author",
-            "date": "2000-01-01",
+            "date": "0000-01-01",
             "template": "article.html",
+            "static": "",
         }
+
+        self.date = (0, 1, 1)
 
         self.regions = []
 
@@ -340,12 +374,20 @@ class AmbergenMarkupGenerator:
         lines = self.source[:self.metadata_length].split("\n")
         for line in lines:
             line = line.strip().split(" ", 1)
-            if len(line) < 2:
-                continue
-
-            self.metadata[line[0].strip()] = line[1].strip()
+            if len(line) > 1:
+                self.metadata[line[0].strip()] = line[1].strip()
+            elif len(line) > 0:
+                self.metadata[line[0].strip()] = "empty"
 
         self.metadata_length += len(SEPARATOR)
+
+        # Convert date format.
+        self.date, self.metadata["date"] = parseDate(self.metadata["date"])
+
+        # Unset metadata values for static pages.
+        if self.metadata["static"] == "empty":
+            self.metadata["author"] = ""
+            self.metadata["date"] = ""
 
     # ========================================
     #
@@ -472,13 +514,13 @@ class AmbergenMarkupGenerator:
 
                 # Newline/whitespace handling.
                 if self.ch == "\n":
+                    if self.list_depth >= 0:
+                        self.tagListItemBegin(-1)
+                        self.list_depth = -1
+
                     if self.empty_line_count == 0 and latest_region.hasInner():
                         self.appendInner(" ")
                     elif self.empty_line_count == 1:
-                        if self.list_depth >= 0:
-                            self.tagListItemBegin(-1)
-                            self.list_depth = -1
-
                         self.appendRegion("paragraph_end")
                         self.appendRegion("paragraph")
 
@@ -551,13 +593,15 @@ class AmbergenMarkupGenerator:
 
             # Insert literal character.
             if self.ch == "<":
-                self.appendInner("&lt")
+                self.appendInner("&lt;")
             elif self.ch == ">":
-                self.appendInner("&gt")
+                self.appendInner("&gt;")
             else:
                 self.appendInner(self.ch)
 
+        self.tagListItemBegin(-1)
         self.appendRegion("paragraph_end")
+        self.appendRegion("section_end")
 
     def export(self):
         tag_counts = {}
@@ -597,84 +641,255 @@ class AmbergenMarkupGenerator:
             self.html += region.export()
 
 
+# ========================================
+#
+# Generator content.
+
+
+class GeneratorContentType(enum.Enum):
+
+    HTML = enum.auto()
+    AGM = enum.auto()
+
+
+class GeneratorContent:
+
+    def __init__(self, source_path, build_path, content_type, data):
+        self.source_path = source_path
+        self.build_path = build_path
+
+        self.content_type = content_type
+        self.data = data
+
+    def build(self, generator):
+        data = ""
+
+        build_path = self.build_path
+
+        if self.content_type == GeneratorContentType.HTML:
+            build_path += ".html"
+            data = generator.generateTemplatedHtml(self.data)
+        elif self.content_type == GeneratorContentType.AGM:
+            build_path += ".html"
+            data = generator.generateTemplatedHtml(
+                generator.getTemplate(self.data.metadata["template"]),
+                metadata=self.data.metadata,
+                body=self.data.html
+            )
+
+        try: os.makedirs(os.path.dirname(build_path))
+        except: pass
+
+        f = open(build_path, "w")
+        f.write(data)
+        f.close()
+
+# ========================================
+#
+# Generator.
+
+
 class Generator:
 
     def __init__(self, source_dir="", build_dir="public"):
         self.source_dir = os.path.abspath(source_dir)
         self.build_dir = os.path.abspath(build_dir)
 
+        print(f"Source dir: '{self.source_dir}'")
+        print(f"Build dir: '{self.source_dir}'")
+
         self.assets_dir = os.path.join(self.source_dir, "assets")
         self.content_dir = os.path.join(self.source_dir, "content")
         self.templates_dir = os.path.join(self.source_dir, "templates")
 
-        print(f"Source dir: '{self.source_dir}'")
-        print(f"Build dir: '{self.source_dir}'")
-
         self.templates = {}
+        self.content = {}
+        self.listings = {}
 
-    def getTemplate(self, path):
-        t = self.templates.get(path)
-        if not t:
-            f = open(os.path.join(self.templates_dir, path), "r")
-            t = f.read()
+    def getBuildPath(self, path, source_dir=None):
+        source_dir = source_dir or self.content_dir
+
+        path, old_ext = os.path.splitext(path)
+
+        path = path[len(source_dir) + 1:]
+        path = os.path.join(self.build_dir, path)
+
+        return (path, old_ext)
+
+    # ========================================
+    #
+    # Templates.
+
+    def loadTemplates(self):
+        print("Loading templates...")
+
+        template_paths = glob.glob(os.path.join(self.templates_dir, "**"), recursive=True)
+
+        for template_path in template_paths:
+            if os.path.isdir(template_path):
+                continue
+
+            template_name = template_path[len(self.templates_dir) + 1:]
+
+            print(f"Loading {template_path} as {template_name}...")
+
+            f = open(template_path, "r")
+            self.templates[template_name] = f.read()
             f.close()
+
+    def getTemplate(self, name):
+        t = self.templates.get(name)
+        if t:
+            return t
+
+        t = f"<span>Template {name} not found</span>"
 
         return t
 
-    def generateTemplatedHtml(self, source, body="", metadata={}):
-        return source.format(
-            title=metadata.get("title", "None"),
-            author=metadata.get("author", "None"),
-            date=metadata.get("date", "None"),
-            body=body
-        )
+    def generateTemplatedHtml(self, source, metadata={}, body=""):
+        class AutoDict(dict):
+            def __missing__(self, key):
+                return "{" + key + "}"
 
-    def buildMarkupPage(self, markup, build_path):
-        f = open(build_path, "w")
-        f.write(self.generateTemplatedHtml(self.getTemplate(markup.metadata["template"]),
-                                           body=markup.html, metadata=markup.metadata))
-        f.close()
+        source = source.format_map(AutoDict(
+            header=self.getTemplate("header.html"),
+            footer=self.getTemplate("footer.html")
+        ))
 
-    def buildHtmlPage(self, source, build_path):
-        f = open(build_path, "w")
-        f.write(self.generateTemplatedHtml(source))
-        f.close()
+        source = source.format_map(AutoDict(
+            **self.listings
+        ))
 
-    def build(self):
-        print("Building site...")
+        source = source.format_map(AutoDict(
+            body=body,
+            title=metadata.get("title", ""),
+            author=metadata.get("author", ""),
+            date=metadata.get("date", ""),
+        ))
 
-        shutil.copytree(self.assets_dir, os.path.join(self.build_dir, "assets"), dirs_exist_ok=True)
+        return source
 
-        # Enumerate .agm files in content/.
-        source_paths = glob.glob(os.path.join(self.content_dir, "**"), recursive=True)
+    # ========================================
+    #
+    # Content handling.
 
-        for source_path in source_paths:
-            if os.path.isdir(source_path):
+    # Load content and parse markup etc.
+    def loadContent(self):
+        print("Loading content...")
+
+        content_paths = glob.glob(os.path.join(self.content_dir, "**"), recursive=True)
+
+        for content_path in content_paths:
+            if os.path.isdir(content_path):
                 continue
 
-            print(f"Building {source_path}...")
+            print(f"Loading {content_path}...")
 
-            build_path = source_path
-            ext = os.path.splitext(source_path)[1]
+            build_path, ext = self.getBuildPath(content_path)
 
-            if ext == ".agm":
-                build_path = build_path[len(self.content_dir) + 1:]
-                build_path = os.path.join(self.build_dir, build_path)
-                build_path = os.path.splitext(build_path)[0] + ".html"
+            content_type = None
+            data = None
 
-                try: os.mkdir(os.path.dirname(build_path))
-                except: pass
-
-                markup = AmbergenMarkupGenerator(source_path)
-
-                self.buildMarkupPage(markup, build_path)
-            elif ext == ".html":
-                f = open(source_path, "r")
-                source = f.read()
+            if ext == ".html":
+                content_type = GeneratorContentType.HTML
+                f = open(content_path, "r")
+                data = f.read()
                 f.close()
+            elif ext == ".agm":
+                content_type = GeneratorContentType.AGM
+                data = AmbergenMarkupGenerator(content_path)
+            else:
+                print(f"Unknown content extension {ext}")
+                continue
 
-                self.buildHtmlPage(source, build_path)
+            self.content[content_path] = GeneratorContent(content_path, build_path, content_type, data)
 
+
+    # Build content. This must occur after listings are generated
+    # since HTML template expansion which happens here will require
+    # the listings.
+    def buildContent(self):
+        print("Building content...")
+
+        for content_path in self.content:
+            print(f"Building {content_path}...")
+
+            self.content[content_path].build(self)
+
+    # ========================================
+    #
+    # Content listings.
+
+    def generateListingHtml(self, listing_dir, listing_name):
+        html = ""
+
+        content_dirs = glob.glob(os.path.join(listing_dir, "**"))
+
+        # [(index_paths, dir), ...]
+        content_listing = []
+
+        # Get list of valid index files to list.
+        for content_dir in content_dirs:
+            if not os.path.isdir(content_dir):
+                continue
+
+            content_index_path = os.path.join(content_dir, "index.agm")
+            if content_index_path in self.content:
+                content_listing.append((content_index_path, content_dir))
+
+        # Sort content chronologically.
+        content_listing.sort(key=lambda l: self.content[l[0]].data.date, reverse=True)
+
+        # Then actually emit the HTML for the listing.
+        for content_index_path, content_dir in content_listing:
+            content = self.content[content_index_path]
+
+            content_dir_rel = content_dir[len(self.content_dir):]
+            print(f"Adding {content_dir_rel}")
+
+            html += "<div class=\"listing-item\">"
+            html += "<div>"
+            html += "<a class=\"link\" href=\"" + content_dir_rel + "\">"
+            html += content.data.metadata["title"]
+            html += "</a>"
+            html += "</div>"
+            html += "<div class=\"listing-item-metadata\">"
+            html += content.data.metadata["date"]
+            html += "</div>"
+            html += "</div>"
+
+        return html
+
+    def generateListings(self):
+        print("Generating content listings...")
+
+        listing_dirs = glob.glob(os.path.join(self.content_dir, "**"))
+
+        for listing_dir in listing_dirs:
+            if not os.path.isdir(listing_dir):
+                continue
+
+            listing_name = "listing_" + generateSlug(listing_dir[len(self.content_dir) + 1:], "_")
+
+            print(f"Generating listing for {listing_name}...")
+
+            self.listings[listing_name] = self.generateListingHtml(listing_dir, listing_name)
+
+    # ========================================
+    #
+    # Main build entrypoint.
+
+    def build(self):
+        print("Initiating build...")
+
+        self.loadTemplates()
+        self.loadContent()
+        self.generateListings()
+
+        # Copy assets/ tree.
+        shutil.copytree(self.assets_dir, os.path.join(self.build_dir, "assets"), dirs_exist_ok=True)
+
+        self.buildContent()
 
 # ========================================
 #
@@ -693,7 +908,7 @@ if __name__ == "__main__":
 
     def doMakeSourceDir(path):
         try:
-            os.mkdir(os.path.join(SOURCE_DIR, path))
+            os.makedirs(os.path.join(SOURCE_DIR, path))
         except FileExistsError:
             pass
 
@@ -783,6 +998,20 @@ if __name__ == "__main__":
             "",
         ])
 
+        INITIAL_HTML_HEADER = "\n".join([
+            "",
+            "<header>",
+            "</header>",
+            "",
+        ])
+
+        INITIAL_HTML_FOOTER = "\n".join([
+            "",
+            "<footer>",
+            "</footer>",
+            "",
+        ])
+
         doMakeSourceDir("assets")
         doMakeSourceDir("assets/images")
         doMakeSourceDir("assets/style")
@@ -795,6 +1024,8 @@ if __name__ == "__main__":
         doMakeSourceFile("content/about/index.agm", INITIAL_AGM_ARTICLE)
         doMakeSourceDir("templates")
         doMakeSourceFile("templates/article.html", INITIAL_HTML_TEMPLATE)
+        doMakeSourceFile("templates/header.html", INITIAL_HTML_HEADER)
+        doMakeSourceFile("templates/footer.html", INITIAL_HTML_FOOTER)
 
     def commandServe():
         from http.server import SimpleHTTPRequestHandler, HTTPServer
