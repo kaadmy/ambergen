@@ -190,8 +190,11 @@ class AmbergenMarkupGenerator:
         generator.appendRegion("paragraph")
 
     def tagUrlEnd(generator):
-        url_region = generator.getRegion()
         region = generator.getRegion(["link", "embed_image", "embed_image_pixel", "embed_image_small"])
+        if not region:
+            return
+
+        url_region = generator.getRegion()
 
         if region.definition.html_tag == "img":
             region.values["src"] = url_region.inner
@@ -199,7 +202,7 @@ class AmbergenMarkupGenerator:
 
             if region.tag_name != "embed_image_small":
                 region.inner = "<span class=\"embed-caption\"><em>" + region.inner + "</em></span>"
-        else:
+        elif region.definition.html_tag == "a":
             region.values["href"] = url_region.inner
 
     def tagListItemBegin(generator, indent):
@@ -650,6 +653,7 @@ class GeneratorContentType(enum.Enum):
 
     HTML = enum.auto()
     AGM = enum.auto()
+    IMAGE = enum.auto()
 
 
 class GeneratorContent:
@@ -661,26 +665,26 @@ class GeneratorContent:
         self.content_type = content_type
         self.data = data
 
-    def build(self, generator):
-        data = ""
+    def changeExt(self, ext):
+        self.build_path = os.path.splitext(self.build_path)[0] + ext
 
-        build_path = self.build_path
+    def build(self, generator):
+        data = self.data
 
         if self.content_type == GeneratorContentType.HTML:
-            build_path += ".html"
             data = generator.generateTemplatedHtml(self.data)
         elif self.content_type == GeneratorContentType.AGM:
-            build_path += ".html"
+            self.changeExt(".html")
             data = generator.generateTemplatedHtml(
                 generator.getTemplate(self.data.metadata["template"]),
                 metadata=self.data.metadata,
                 body=self.data.html
             )
 
-        try: os.makedirs(os.path.dirname(build_path))
+        try: os.makedirs(os.path.dirname(self.build_path))
         except: pass
 
-        f = open(build_path, "w")
+        f = open(self.build_path, "wb" if type(self.data) == bytes else "w")
         f.write(data)
         f.close()
 
@@ -709,12 +713,10 @@ class Generator:
     def getBuildPath(self, path, source_dir=None):
         source_dir = source_dir or self.content_dir
 
-        path, old_ext = os.path.splitext(path)
-
         path = path[len(source_dir) + 1:]
         path = os.path.join(self.build_dir, path)
 
-        return (path, old_ext)
+        return path
 
     # ========================================
     #
@@ -785,7 +787,8 @@ class Generator:
 
             print(f"Loading {content_path}...")
 
-            build_path, ext = self.getBuildPath(content_path)
+            build_path = self.getBuildPath(content_path)
+            ext = os.path.splitext(build_path)[1]
 
             content_type = None
             data = None
@@ -798,6 +801,11 @@ class Generator:
             elif ext == ".agm":
                 content_type = GeneratorContentType.AGM
                 data = AmbergenMarkupGenerator(content_path)
+            elif ext in [".png", ".jpg"]:
+                content_type = GeneratorContentType.IMAGE
+                f = open(content_path, "rb")
+                data = f.read()
+                f.close()
             else:
                 print(f"Unknown content extension {ext}")
                 continue
